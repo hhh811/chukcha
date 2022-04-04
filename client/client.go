@@ -2,6 +2,8 @@ package client
 
 import (
 	"bytes"
+	"chukcha/server"
+	"encoding/json"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -13,9 +15,10 @@ const defaultScratchSize = 64 * 1024
 
 // Client represents an instance of client connected to a set of Chukcha servers
 type Simple struct {
-	addrs []string
-	cl    *http.Client
-	off   uint64
+	addrs    []string
+	cl       *http.Client
+	curChunk server.Chunk
+	off      uint64
 }
 
 // a new client for chukcha server
@@ -55,11 +58,16 @@ func (s *Simple) Receive(scratch []byte) ([]byte, error) {
 
 	addrIdx := rand.Intn(len(s.addrs))
 	addr := s.addrs[addrIdx]
-	readURL := fmt.Sprintf("%s/read?off=%d&maxSize=%d", addr, s.off, len(scratch))
+
+	if err := s.updateCurrentChunk(addr); err != nil {
+		return nil, fmt.Errorf("updateCurrentChunk: %w", err)
+	}
+
+	readURL := fmt.Sprintf("%s/read?off=%d&maxSize=%d&chunk=%s", addr, s.off, len(scratch), s.curChunk.Name)
 
 	resp, err := s.cl.Get(readURL)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("read %q: %v", readURL, err)
 	}
 
 	defer resp.Body.Close()
@@ -73,16 +81,23 @@ func (s *Simple) Receive(scratch []byte) ([]byte, error) {
 	b := bytes.NewBuffer(scratch[0:0])
 	_, err = io.Copy(b, resp.Body)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("writing response: %v", err)
 	}
 
 	// 0 bytes read but no errors means the end of file by convention
 	if b.Len() == 0 {
-		if err := s.ackCurrentChunk(addr); err != nil {
-			return nil, err
+		if !s.curChunk.Complete {
+			return nil, io.EOF
 		}
 
-		return nil, io.EOF
+		if err := s.ackCurrentChunk(addr); err != nil {
+			return nil, fmt.Errorf("ack current chunk: %v", err)
+		}
+
+		// need to read the next chunk so that we do not return empty response
+		s.curChunk = server.Chunk{}
+		s.off = 0
+		return s.Receive(scratch)
 	}
 
 	s.off += uint64(b.Len())
@@ -90,8 +105,62 @@ func (s *Simple) Receive(scratch []byte) ([]byte, error) {
 	return b.Bytes(), nil
 }
 
+func (s *Simple) updateCurrentChunk(addr string) error {
+	if s.curChunk.Name != "" {
+		return nil
+	}
+
+	chunks, err := s.listChunks(addr)
+	if err != nil {
+		return fmt.Errorf("listChunks failed: %v", err)
+	}
+
+	if len(chunks) == 0 {
+		return io.EOF
+	}
+
+	// We need to prioritise the chunks that are complete
+	// so that we ack them
+	for _, c := range chunks {
+		if c.Complete {
+			s.curChunk = c
+			return nil
+		}
+	}
+
+	s.curChunk = chunks[0]
+	return nil
+}
+
+func (s *Simple) listChunks(addr string) ([]server.Chunk, error) {
+	listRUL := fmt.Sprintf("%s/listChunks", addr)
+
+	resp, err := s.cl.Get(listRUL)
+	if err != nil {
+		return nil, err
+	}
+
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, err := ioutil.ReadAll(resp.Body)
+		if err != nil {
+			return nil, err
+		}
+
+		return nil, fmt.Errorf("listChunks error: %s", string(body))
+	}
+
+	var res []server.Chunk
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+		return nil, err
+	}
+
+	return res, nil
+}
+
 func (s *Simple) ackCurrentChunk(addr string) error {
-	resp, err := s.cl.Get(addr + "/ack")
+	resp, err := s.cl.Get(fmt.Sprintf(addr+"/ack?chunk=%s", s.curChunk.Name))
 	if err != nil {
 		return err
 	}
