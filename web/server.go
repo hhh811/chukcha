@@ -1,21 +1,25 @@
 package web
 
 import (
-	"chukcha/server"
 	"fmt"
 	"io"
 
 	"github.com/valyala/fasthttp"
 )
 
-const defaultBufSize = 512 * 1024
+// Storage defines an interface for the backend storage
+type Storage interface {
+	Write(msgs []byte) error
+	Read(off uint64, maxSize uint64, w io.Writer) error
+	Ack() error
+}
 
 // Server implements a web server
 type Server struct {
-	s *server.InMemory
+	s Storage
 }
 
-func NewServer(s *server.InMemory) *Server {
+func NewServer(s Storage) *Server {
 	return &Server{s: s}
 }
 
