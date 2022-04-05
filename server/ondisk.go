@@ -1,14 +1,21 @@
 package server
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"sync"
 )
 
 const maxFileChunkSize = 20 * 1024 * 1024
+
+var errBufTooSmall = errors.New("the buffer is too small to contain a single message")
+var filenameRegexp = regexp.MustCompile("^chunk([0-9]+)$")
 
 type OnDisk struct {
 	dirname string
@@ -19,11 +26,41 @@ type OnDisk struct {
 	fps           map[string]*os.File
 }
 
-func NewOndisk(dirname string) *OnDisk {
-	return &OnDisk{
+func NewOndisk(dirname string) (*OnDisk, error) {
+	s := &OnDisk{
 		dirname: dirname,
 		fps:     make(map[string]*os.File),
 	}
+
+	if err := s.initLastChunkIndex(dirname); err != nil {
+		return nil, err
+	}
+
+	return s, nil
+}
+
+func (s *OnDisk) initLastChunkIndex(dirname string) error {
+	files, err := os.ReadDir(dirname)
+	if err != nil {
+		return fmt.Errorf("readdir(%q): %v", dirname, err)
+	}
+
+	for _, fi := range files {
+		res := filenameRegexp.FindStringSubmatch(fi.Name())
+		if res == nil {
+			continue
+		}
+
+		chunkIdx, err := strconv.Atoi(res[1])
+		if err != nil {
+			return fmt.Errorf("unexpected err parsing filename %q: %v", fi.Name(), err)
+		}
+
+		if uint64(chunkIdx)+1 >= s.lastChunkIdx {
+			s.lastChunkIdx = uint64(chunkIdx) + 1
+		}
+	}
+	return nil
 }
 
 // Write accepts the message from the clients and stores them
@@ -155,4 +192,22 @@ func (s *OnDisk) ListChunks() ([]Chunk, error) {
 	}
 
 	return res, nil
+}
+
+func cutToLastMessage(res []byte) (truncated []byte, rest []byte, err error) {
+	n := len(res)
+
+	if n == 0 {
+		return res, nil, nil
+	}
+
+	if res[n-1] == '\n' {
+		return res, nil, nil
+	}
+
+	lastPos := bytes.LastIndexByte(res, '\n')
+	if lastPos < 0 {
+		return nil, nil, errBufTooSmall
+	}
+	return res[0 : lastPos+1], res[lastPos+1:], nil
 }

@@ -11,7 +11,6 @@ import (
 
 var (
 	dirname = flag.String("dirname", "", "The dirname where to put all the data")
-	inmem   = flag.Bool("inmem", false, "Whether or not use in-memory storage instead of a disk-based one")
 	port    = flag.Uint("port", 8061, "Network port to listen on")
 )
 
@@ -20,22 +19,21 @@ func main() {
 
 	var backend web.Storage
 
-	if *inmem {
-		backend = &server.InMemory{}
-	} else {
-		if *dirname == "" {
-			log.Fatalf("The flag `--dirname` must be provided")
-		}
+	if *dirname == "" {
+		log.Fatalf("The flag `--dirname` must be provided")
+	}
 
-		filename := filepath.Join(*dirname, "write_test")
-		fp, err := os.OpenFile(filename, os.O_CREATE|os.O_RDWR, 0666)
-		if err != nil {
-			log.Fatalf("Could not create test file %q: %v", filename, err)
-		}
-		defer fp.Close()
-		os.Remove(fp.Name())
+	filename := filepath.Join(*dirname, "write_test")
+	fp, err := os.OpenFile(filename, os.O_CREATE|os.O_RDWR, 0666)
+	if err != nil {
+		log.Fatalf("Could not create test file %q: %v", filename, err)
+	}
+	defer fp.Close()
+	os.Remove(fp.Name())
 
-		backend = server.NewOndisk(*dirname)
+	backend, err = server.NewOndisk(*dirname)
+	if err != nil {
+		log.Fatalf("Cound not initialize on-disk backend: %v", err)
 	}
 
 	s := web.NewServer(backend, *port)

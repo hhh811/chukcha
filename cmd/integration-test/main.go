@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"go/build"
 	"io"
+	"io/ioutil"
 	"log"
 	"net"
 	"os"
@@ -51,6 +52,8 @@ func runTest() error {
 	os.RemoveAll(dbPath)
 	os.MkdirAll(dbPath, 0777)
 
+	ioutil.WriteFile("/tmp/chukcha/chunk1", []byte("12345\n"), 0666)
+
 	log.Printf("Running chukcha on port %d", port)
 
 	cmd := exec.Command(goPath+"/bin/chukcha", "-dirname="+dbPath, fmt.Sprintf("-port=%d", port))
@@ -83,6 +86,8 @@ func runTest() error {
 	if err != nil {
 		return fmt.Errorf("receive error: %v", err)
 	}
+
+	want += 12345
 
 	if want != got {
 		return fmt.Errorf("the expected sum %d is not equal to the actual sum %d", want, got)
