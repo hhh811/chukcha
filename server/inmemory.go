@@ -96,6 +96,7 @@ func (s *InMemory) Ack(chunk string) error {
 	return nil
 }
 
+// ListChunks returns the list of current chunks
 func (s *InMemory) ListChunks() ([]Chunk, error) {
 	s.RLock()
 	defer s.RUnlock()

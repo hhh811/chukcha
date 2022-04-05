@@ -47,12 +47,13 @@ func runTest() error {
 
 	port := 8061
 
-	dbPath := "/tmp/chukcha.db"
-	os.Remove(dbPath)
+	dbPath := "/tmp/chukcha"
+	os.RemoveAll(dbPath)
+	os.MkdirAll(dbPath, 0777)
 
 	log.Printf("Running chukcha on port %d", port)
 
-	cmd := exec.Command(goPath+"/bin/chukcha", "-inmem", "-filename="+dbPath, fmt.Sprintf("-port=%d", port))
+	cmd := exec.Command(goPath+"/bin/chukcha", "-dirname="+dbPath, fmt.Sprintf("-port=%d", port))
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.Start()
