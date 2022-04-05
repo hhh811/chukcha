@@ -77,14 +77,10 @@ func runTest() error {
 	log.Printf("Starting the test")
 
 	s := client.NewSimple([]string{fmt.Sprintf("http://localhost:%d", port)})
-	want, err := send(s)
-	if err != nil {
-		return fmt.Errorf("send error: %v", err)
-	}
 
-	got, err := receive(s)
+	want, got, err := sendAndReceiveConcurrently(s)
 	if err != nil {
-		return fmt.Errorf("receive error: %v", err)
+		return err
 	}
 
 	want += 12345
@@ -94,6 +90,46 @@ func runTest() error {
 	}
 
 	return nil
+}
+
+type sumAndErr struct {
+	sum int64
+	err error
+}
+
+func sendAndReceiveConcurrently(s *client.Simple) (want, got int64, err error) {
+	wantCh := make(chan sumAndErr, 1)
+	gotCh := make(chan sumAndErr, 1)
+	sendFinishedCh := make(chan bool, 1)
+
+	go func() {
+		want, err := send(s)
+		wantCh <- sumAndErr{
+			sum: want,
+			err: err,
+		}
+		sendFinishedCh <- true
+	}()
+
+	go func() {
+		got, err := receive(s, sendFinishedCh)
+		gotCh <- sumAndErr{
+			sum: got,
+			err: err,
+		}
+	}()
+
+	wantRes := <-wantCh
+	if wantRes.err != nil {
+		return 0, 0, fmt.Errorf("send error: %v", wantRes.err)
+	}
+
+	gotRes := <-gotCh
+	if gotRes.err != nil {
+		return 0, 0, fmt.Errorf("receive error: %v", gotRes.err)
+	}
+
+	return wantRes.sum, gotRes.sum, err
 }
 
 func send(s *client.Simple) (sum int64, err error) {
@@ -137,7 +173,7 @@ func send(s *client.Simple) (sum int64, err error) {
 	return sum, nil
 }
 
-func receive(s *client.Simple) (sum int64, err error) {
+func receive(s *client.Simple, sendFinishedCh chan bool) (sum int64, err error) {
 	buf := make([]byte, maxBufferSize)
 
 	var parseTime time.Duration
@@ -150,10 +186,22 @@ func receive(s *client.Simple) (sum int64, err error) {
 		return r == '\n'
 	}
 
+	sendFinished := false
+
 	for {
+		select {
+		case <-sendFinishedCh:
+			sendFinished = true
+		default:
+		}
+
 		res, err := s.Receive(buf)
 		if errors.Is(err, io.EOF) {
-			return sum, nil
+			if sendFinished {
+				return sum, nil
+			}
+			time.Sleep(time.Millisecond * 10)
+			continue
 		} else if err != nil {
 			return 0, err
 		}
