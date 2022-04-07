@@ -1,7 +1,7 @@
 package web
 
 import (
-	"chukcha/server"
+	"chukcha/protocol"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -12,9 +12,9 @@ import (
 // Storage defines an interface for the backend storage
 type Storage interface {
 	Write(msgs []byte) error
-	ListChunks() ([]server.Chunk, error)
+	ListChunks() ([]protocol.Chunk, error)
 	Read(chunk string, off uint64, maxSize uint64, w io.Writer) error
-	Ack(chunk string) error
+	Ack(chunk string, size uint64) error
 }
 
 // Server implements a web server
@@ -56,7 +56,13 @@ func (s *Server) ackHandler(ctx *fasthttp.RequestCtx) {
 		ctx.WriteString(fmt.Sprintf("bad `chunk` GET param: chunk name must be provided"))
 	}
 
-	if err := s.s.Ack(string(chunk)); err != nil {
+	size, err := ctx.QueryArgs().GetUint("size")
+	if err != nil {
+		ctx.SetStatusCode(fasthttp.StatusBadRequest)
+		ctx.WriteString(fmt.Sprintf("bad `size` GET param: %v", err))
+	}
+
+	if err := s.s.Ack(string(chunk), uint64(size)); err != nil {
 		ctx.SetStatusCode(fasthttp.StatusInternalServerError)
 		ctx.WriteString(err.Error())
 	}

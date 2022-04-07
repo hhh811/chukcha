@@ -1,12 +1,9 @@
 package main
 
 import (
-	"chukcha/server"
-	"chukcha/web"
+	"chukcha/integration"
 	"flag"
 	"log"
-	"os"
-	"path/filepath"
 )
 
 var (
@@ -17,26 +14,11 @@ var (
 func main() {
 	flag.Parse()
 
-	var backend web.Storage
-
 	if *dirname == "" {
 		log.Fatalf("The flag `--dirname` must be provided")
 	}
 
-	filename := filepath.Join(*dirname, "write_test")
-	fp, err := os.OpenFile(filename, os.O_CREATE|os.O_RDWR, 0666)
-	if err != nil {
-		log.Fatalf("Could not create test file %q: %v", filename, err)
+	if err := integration.InitAndServe(*dirname, *port); err != nil {
+		log.Fatalf("InitAndServe failed: %v", err)
 	}
-	defer fp.Close()
-	os.Remove(fp.Name())
-
-	backend, err = server.NewOndisk(*dirname)
-	if err != nil {
-		log.Fatalf("Cound not initialize on-disk backend: %v", err)
-	}
-
-	s := web.NewServer(backend, *port)
-	log.Printf("Listening connections")
-	s.Serve()
 }

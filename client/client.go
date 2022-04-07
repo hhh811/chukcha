@@ -2,7 +2,7 @@ package client
 
 import (
 	"bytes"
-	"chukcha/server"
+	"chukcha/protocol"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -17,7 +17,7 @@ const defaultScratchSize = 64 * 1024
 type Simple struct {
 	addrs    []string
 	cl       *http.Client
-	curChunk server.Chunk
+	curChunk protocol.Chunk
 	off      uint64
 }
 
@@ -101,7 +101,7 @@ func (s *Simple) Receive(scratch []byte) ([]byte, error) {
 		}
 
 		// need to read the next chunk so that we do not return empty response
-		s.curChunk = server.Chunk{}
+		s.curChunk = protocol.Chunk{}
 		s.off = 0
 		return s.Receive(scratch)
 	}
@@ -156,7 +156,7 @@ func (s *Simple) updateCurrentChunkCompleteStatus(addr string) error {
 	return nil
 }
 
-func (s *Simple) listChunks(addr string) ([]server.Chunk, error) {
+func (s *Simple) listChunks(addr string) ([]protocol.Chunk, error) {
 	listRUL := fmt.Sprintf("%s/listChunks", addr)
 
 	resp, err := s.cl.Get(listRUL)
@@ -175,7 +175,7 @@ func (s *Simple) listChunks(addr string) ([]server.Chunk, error) {
 		return nil, fmt.Errorf("listChunks error: %s", string(body))
 	}
 
-	var res []server.Chunk
+	var res []protocol.Chunk
 	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
 		return nil, err
 	}
@@ -184,7 +184,7 @@ func (s *Simple) listChunks(addr string) ([]server.Chunk, error) {
 }
 
 func (s *Simple) ackCurrentChunk(addr string) error {
-	resp, err := s.cl.Get(fmt.Sprintf(addr+"/ack?chunk=%s", s.curChunk.Name))
+	resp, err := s.cl.Get(fmt.Sprintf(addr+"/ack?chunk=%s&size=%d", s.curChunk.Name, s.off))
 	if err != nil {
 		return err
 	}
