@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"chukcha/protocol"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -10,6 +11,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strconv"
+	"strings"
 	"sync"
 )
 
@@ -18,8 +20,16 @@ const maxFileChunkSize = 20 * 1024 * 1024
 var errBufTooSmall = errors.New("the buffer is too small to contain a single message")
 var filenameRegexp = regexp.MustCompile("^chunk([0-9]+)$")
 
+type StorageHooks interface {
+	BeforeCreatingChunk(ctx context.Context, category string, fileName string) error
+}
+
 type OnDisk struct {
-	dirname string
+	dirname      string
+	category     string
+	instanceName string
+
+	repl StorageHooks
 
 	writeMu       sync.RWMutex
 	lastChunk     string
@@ -30,10 +40,13 @@ type OnDisk struct {
 	fps   map[string]*os.File
 }
 
-func NewOndisk(dirname string) (*OnDisk, error) {
+func NewOndisk(dirname, category, instanceName string, repl StorageHooks) (*OnDisk, error) {
 	s := &OnDisk{
-		dirname: dirname,
-		fps:     make(map[string]*os.File),
+		dirname:      dirname,
+		category:     category,
+		instanceName: instanceName,
+		repl:         repl,
+		fps:          make(map[string]*os.File),
 	}
 
 	if err := s.initLastChunkIndex(dirname); err != nil {
@@ -49,8 +62,14 @@ func (s *OnDisk) initLastChunkIndex(dirname string) error {
 		return fmt.Errorf("readdir(%q): %v", dirname, err)
 	}
 
+	prefix := s.instanceName + "-"
+
 	for _, fi := range files {
-		res := filenameRegexp.FindStringSubmatch(fi.Name())
+		if !strings.HasPrefix(fi.Name(), prefix) {
+			continue
+		}
+
+		res := filenameRegexp.FindStringSubmatch(strings.TrimPrefix(fi.Name(), prefix))
 		if res == nil {
 			continue
 		}
@@ -68,14 +87,18 @@ func (s *OnDisk) initLastChunkIndex(dirname string) error {
 }
 
 // Write accepts the message from the clients and stores them
-func (s *OnDisk) Write(msgs []byte) error {
+func (s *OnDisk) Write(ctx context.Context, msgs []byte) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
 	if s.lastChunk == "" || s.lastChunkSize+uint64(len(msgs)) > maxFileChunkSize {
-		s.lastChunk = fmt.Sprintf("chunk%d", s.lastChunkIdx)
+		s.lastChunk = fmt.Sprintf("%s-chunk%09d", s.instanceName, s.lastChunkIdx)
 		s.lastChunkSize = 0
 		s.lastChunkIdx++
+
+		if err := s.repl.BeforeCreatingChunk(ctx, s.category, s.lastChunk); err != nil {
+			return fmt.Errorf("before creating new chunk: %w", err)
+		}
 	}
 
 	fp, err := s.getFileDescriptor(s.lastChunk, true)

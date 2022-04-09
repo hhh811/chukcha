@@ -4,11 +4,14 @@ import (
 	"bytes"
 	"chukcha/protocol"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"math/rand"
 	"net/http"
+	"net/url"
+	"strconv"
 )
 
 const defaultScratchSize = 64 * 1024
@@ -30,8 +33,11 @@ func NewSimple(addrs []string) *Simple {
 }
 
 // Send sends the messages to the Chukcha servers.
-func (s *Simple) Send(msgs []byte) error {
-	resp, err := s.cl.Post(s.addrs[0]+"/write", "application/octet-stream", bytes.NewReader(msgs))
+func (s *Simple) Send(category string, msgs []byte) error {
+	u := url.Values{}
+	u.Add("category", category)
+
+	resp, err := s.cl.Post(s.addrs[0]+"/write?"+u.Encode(), "application/octet-stream", bytes.NewReader(msgs))
 	if err != nil {
 		return err
 	}
@@ -48,26 +54,46 @@ func (s *Simple) Send(msgs []byte) error {
 	return nil
 }
 
-// Receive will either wait for new messages or return an
+var errRetry = errors.New("please retry the request")
+
+// Process will either wait for new messages or return an
 // error in case sth goes wrong.
 // The scratch buffer can be used to read
-func (s *Simple) Receive(scratch []byte) ([]byte, error) {
+// The read offset will advance only if the process() function
+// returns no errors for the data being processed
+func (s *Simple) Process(category string, scratch []byte, processFn func([]byte) error) error {
 	if scratch == nil {
 		scratch = make([]byte, defaultScratchSize)
 	}
 
+	for {
+		err := s.process(category, scratch, processFn)
+		if err == errRetry {
+			continue
+		}
+		return err
+	}
+}
+
+func (s *Simple) process(category string, scratch []byte, processFn func([]byte) error) error {
 	addrIdx := rand.Intn(len(s.addrs))
 	addr := s.addrs[addrIdx]
 
-	if err := s.updateCurrentChunk(addr); err != nil {
-		return nil, fmt.Errorf("updateCurrentChunk: %w", err)
+	if err := s.updateCurrentChunk(category, addr); err != nil {
+		return fmt.Errorf("updateCurrentChunk: %w", err)
 	}
 
-	readURL := fmt.Sprintf("%s/read?off=%d&maxSize=%d&chunk=%s", addr, s.off, len(scratch), s.curChunk.Name)
+	u := url.Values{}
+	u.Add("off", strconv.Itoa(int(s.off)))
+	u.Add("maxSize", strconv.Itoa(len(scratch)))
+	u.Add("chunk", s.curChunk.Name)
+	u.Add("category", category)
+
+	readURL := fmt.Sprintf("%s/read?%s", addr, u.Encode())
 
 	resp, err := s.cl.Get(readURL)
 	if err != nil {
-		return nil, fmt.Errorf("read %q: %v", readURL, err)
+		return fmt.Errorf("read %q: %v", readURL, err)
 	}
 
 	defer resp.Body.Close()
@@ -75,48 +101,59 @@ func (s *Simple) Receive(scratch []byte) ([]byte, error) {
 	if resp.StatusCode != http.StatusOK {
 		var b bytes.Buffer
 		io.Copy(&b, resp.Body)
-		return nil, fmt.Errorf("http code %d %s", resp.StatusCode, b.String())
+		return fmt.Errorf("http code %d %s", resp.StatusCode, b.String())
 	}
 
 	b := bytes.NewBuffer(scratch[0:0])
 	_, err = io.Copy(b, resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("writing response: %v", err)
+		return fmt.Errorf("writing response: %v", err)
 	}
 
 	// 0 bytes read but no errors means the end of file by convention
 	if b.Len() == 0 {
 		if !s.curChunk.Complete {
-			if err := s.updateCurrentChunkCompleteStatus(addr); err != nil {
-				return nil, fmt.Errorf("updateCurrentChunkCompleteStatus: %v", err)
+			if err := s.updateCurrentChunkCompleteStatus(category, addr); err != nil {
+				return fmt.Errorf("updateCurrentChunkCompleteStatus: %v", err)
+			}
+
+			if !s.curChunk.Complete {
+				if s.off >= s.curChunk.Size {
+					return io.EOF
+				}
+
+				return errRetry
 			}
 		}
 
-		if !s.curChunk.Complete {
-			return nil, io.EOF
+		if s.off < s.curChunk.Size {
+			return errRetry
 		}
 
-		if err := s.ackCurrentChunk(addr); err != nil {
-			return nil, fmt.Errorf("ack current chunk: %v", err)
+		if err := s.ackCurrentChunk(category, addr); err != nil {
+			return fmt.Errorf("ack current chunk: %v", err)
 		}
 
 		// need to read the next chunk so that we do not return empty response
 		s.curChunk = protocol.Chunk{}
 		s.off = 0
-		return s.Receive(scratch)
+		return errRetry
 	}
 
-	s.off += uint64(b.Len())
+	err = processFn(b.Bytes())
+	if err == nil {
+		s.off += uint64(b.Len())
+	}
 
-	return b.Bytes(), nil
+	return err
 }
 
-func (s *Simple) updateCurrentChunk(addr string) error {
+func (s *Simple) updateCurrentChunk(category, addr string) error {
 	if s.curChunk.Name != "" {
 		return nil
 	}
 
-	chunks, err := s.listChunks(addr)
+	chunks, err := s.listChunks(category, addr)
 	if err != nil {
 		return fmt.Errorf("listChunks failed: %v", err)
 	}
@@ -138,8 +175,8 @@ func (s *Simple) updateCurrentChunk(addr string) error {
 	return nil
 }
 
-func (s *Simple) updateCurrentChunkCompleteStatus(addr string) error {
-	chunks, err := s.listChunks(addr)
+func (s *Simple) updateCurrentChunkCompleteStatus(category, addr string) error {
+	chunks, err := s.listChunks(category, addr)
 	if err != nil {
 		return fmt.Errorf("listChunks failed: %v", err)
 	}
@@ -156,8 +193,11 @@ func (s *Simple) updateCurrentChunkCompleteStatus(addr string) error {
 	return nil
 }
 
-func (s *Simple) listChunks(addr string) ([]protocol.Chunk, error) {
-	listRUL := fmt.Sprintf("%s/listChunks", addr)
+func (s *Simple) listChunks(category, addr string) ([]protocol.Chunk, error) {
+	u := url.Values{}
+	u.Add("category", category)
+
+	listRUL := fmt.Sprintf("%s/listChunks?%s", addr, u.Encode())
 
 	resp, err := s.cl.Get(listRUL)
 	if err != nil {
@@ -183,8 +223,13 @@ func (s *Simple) listChunks(addr string) ([]protocol.Chunk, error) {
 	return res, nil
 }
 
-func (s *Simple) ackCurrentChunk(addr string) error {
-	resp, err := s.cl.Get(fmt.Sprintf(addr+"/ack?chunk=%s&size=%d", s.curChunk.Name, s.off))
+func (s *Simple) ackCurrentChunk(category, addr string) error {
+	u := url.Values{}
+	u.Add("chunk", s.curChunk.Name)
+	u.Add("size", strconv.Itoa(int(s.off)))
+	u.Add("category", category)
+
+	resp, err := s.cl.Get(fmt.Sprintf(addr+"/ack?%s", u.Encode()))
 	if err != nil {
 		return err
 	}

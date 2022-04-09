@@ -52,36 +52,20 @@ func simpleClientAndServerTest(t *testing.T, concurrent bool) {
 	}
 
 	t.Cleanup(func() { os.RemoveAll(dbPath) })
-	os.MkdirAll(dbPath, 0777)
 
-	ioutil.WriteFile(filepath.Join(dbPath, "chunk1"), []byte("12345\n"), 0666)
+	categoryPath := filepath.Join(dbPath, "numbers")
+	os.MkdirAll(categoryPath, 0777)
 
+	ioutil.WriteFile(filepath.Join(categoryPath, fmt.Sprintf("hc-chunk%09d", 1)), []byte("12345\n"), 0666)
+
+	// start chukcha
 	log.Printf("Running chukcha on port %d", port)
-
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- InitAndServe(dbPath, uint(port))
+		errCh <- InitAndServe(fmt.Sprintf("http://localhost:%d/", 2379), "hc", dbPath, fmt.Sprintf("localhost:%d", port))
 	}()
-
-	log.Printf("Waiting for the port localhost:%d to open", port)
-	for i := 0; i <= 100; i++ {
-		select {
-		case err := <-errCh:
-			if err != nil {
-				t.Fatalf("InitAndServe failed: %v", err)
-			}
-		default:
-		}
-
-		timeout := time.Millisecond * 50
-		conn, err := net.DialTimeout("tcp", net.JoinHostPort("localhost", fmt.Sprint(port)), timeout)
-		if err != nil {
-			time.Sleep(timeout)
-			continue
-		}
-		conn.Close()
-		break
-	}
+	log.Printf("Waiting for the Chukcha port localhost:%d to open", port)
+	waitForPort(t, port, errCh)
 
 	log.Printf("Starting the test")
 
@@ -113,6 +97,29 @@ func simpleClientAndServerTest(t *testing.T, concurrent bool) {
 
 	if want != got {
 		t.Errorf("the expected sum %d is not equal to the actual sum %d", want, got)
+	}
+}
+
+func waitForPort(t *testing.T, port int, errCh chan error) {
+	t.Helper()
+
+	for i := 0; i <= 100; i++ {
+		select {
+		case err := <-errCh:
+			if err != nil {
+				t.Fatalf("InitAndServe failed: %v", err)
+			}
+		default:
+		}
+
+		timeout := time.Millisecond * 50
+		conn, err := net.DialTimeout("tcp", net.JoinHostPort("localhost", fmt.Sprint(port)), timeout)
+		if err != nil {
+			time.Sleep(timeout)
+			continue
+		}
+		conn.Close()
+		break
 	}
 }
 
@@ -175,7 +182,7 @@ func send(s *client.Simple) (sum int64, err error) {
 
 		if len(buf) >= maxBufferSize {
 			start := time.Now()
-			if err := s.Send(buf); err != nil {
+			if err := s.Send("numbers", buf); err != nil {
 				return 0, err
 			}
 			networkTime += time.Since(start)
@@ -187,7 +194,7 @@ func send(s *client.Simple) (sum int64, err error) {
 
 	if len(buf) != 0 {
 		start := time.Now()
-		if err := s.Send(buf); err != nil {
+		if err := s.Send("numbers", buf); err != nil {
 			return 0, err
 		}
 		networkTime += time.Since(start)
@@ -196,6 +203,8 @@ func send(s *client.Simple) (sum int64, err error) {
 
 	return sum, nil
 }
+
+var randomTempErr = errors.New("a random temporary error occurred")
 
 func receive(s *client.Simple, sendFinishedCh chan bool) (sum int64, err error) {
 	buf := make([]byte, maxBufferSize)
@@ -212,15 +221,41 @@ func receive(s *client.Simple, sendFinishedCh chan bool) (sum int64, err error) 
 
 	sendFinished := false
 
+	loopCnt := 0
+
 	for {
+		loopCnt++
+
 		select {
 		case <-sendFinishedCh:
+			log.Printf("Receive: got information that send finished")
 			sendFinished = true
 		default:
 		}
 
-		res, err := s.Receive(buf)
-		if errors.Is(err, io.EOF) {
+		err := s.Process("numbers", buf, func(res []byte) error {
+			if loopCnt%10 == 0 {
+				return randomTempErr
+			}
+
+			start := time.Now()
+
+			ints := strings.Split(strings.TrimRightFunc(string(res), trimNL), "\n")
+			for _, str := range ints {
+				i, err := strconv.Atoi(str)
+				if err != nil {
+					return err
+				}
+				sum += int64(i)
+			}
+
+			parseTime += time.Since(start)
+			return nil
+		})
+
+		if errors.Is(err, randomTempErr) {
+			continue
+		} else if errors.Is(err, io.EOF) {
 			if sendFinished {
 				return sum, nil
 			}
@@ -230,17 +265,5 @@ func receive(s *client.Simple, sendFinishedCh chan bool) (sum int64, err error) 
 			return 0, err
 		}
 
-		start := time.Now()
-
-		ints := strings.Split(strings.TrimRightFunc(string(res), trimNL), "\n")
-		for _, str := range ints {
-			i, err := strconv.Atoi(str)
-			if err != nil {
-				return 0, err
-			}
-			sum += int64(i)
-		}
-
-		parseTime += time.Since(start)
 	}
 }
