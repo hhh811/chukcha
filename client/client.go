@@ -153,7 +153,7 @@ func (s *Simple) updateCurrentChunk(category, addr string) error {
 		return nil
 	}
 
-	chunks, err := s.listChunks(category, addr)
+	chunks, err := s.ListChunks(category, addr)
 	if err != nil {
 		return fmt.Errorf("listChunks failed: %v", err)
 	}
@@ -176,7 +176,7 @@ func (s *Simple) updateCurrentChunk(category, addr string) error {
 }
 
 func (s *Simple) updateCurrentChunkCompleteStatus(category, addr string) error {
-	chunks, err := s.listChunks(category, addr)
+	chunks, err := s.ListChunks(category, addr)
 	if err != nil {
 		return fmt.Errorf("listChunks failed: %v", err)
 	}
@@ -193,7 +193,7 @@ func (s *Simple) updateCurrentChunkCompleteStatus(category, addr string) error {
 	return nil
 }
 
-func (s *Simple) listChunks(category, addr string) ([]protocol.Chunk, error) {
+func (s *Simple) ListChunks(category, addr string) ([]protocol.Chunk, error) {
 	u := url.Values{}
 	u.Add("category", category)
 

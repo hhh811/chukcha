@@ -86,6 +86,20 @@ func (s *OnDisk) initLastChunkIndex(dirname string) error {
 	return nil
 }
 
+func (s *OnDisk) WriteDirect(chunk string, contents []byte) error {
+	fl := os.O_CREATE | os.O_WRONLY | os.O_APPEND
+
+	filename := filepath.Join(s.dirname, chunk)
+	fp, err := os.OpenFile(filename, fl, 0666)
+	if err != nil {
+		return err
+	}
+	defer fp.Close()
+
+	_, err = fp.Write(contents)
+	return err
+}
+
 // Write accepts the message from the clients and stores them
 func (s *OnDisk) Write(ctx context.Context, msgs []byte) error {
 	s.writeMu.Lock()

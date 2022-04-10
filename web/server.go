@@ -9,13 +9,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 
 	"github.com/valyala/fasthttp"
-	"go.etcd.io/etcd/clientv3"
 )
 
 // Storage defines an interface for the backend storage
@@ -28,24 +25,33 @@ type Storage interface {
 
 // Server implements a web server
 type Server struct {
-	etcd         *clientv3.Client
 	instanceName string
 	dirname      string
 	listenAddr   string
-	replStorage  replication.Storage
 
-	m        sync.Mutex
-	storages map[string]Storage
+	replClient  *replication.State
+	replStorage *replication.Storage
+
+	getOnDisk GetOnDiskFn
 }
 
-func NewServer(etcd *clientv3.Client, instanceName string, dirname string, listenAddr string, replStorage *replication.Storage) *Server {
+type GetOnDiskFn func(category string) (*server.OnDisk, error)
+
+func NewServer(
+	replClient *replication.State,
+	instanceName string,
+	dirname string,
+	listenAddr string,
+	replStorage *replication.Storage,
+	getOnDisk GetOnDiskFn,
+) *Server {
 	return &Server{
-		etcd:         etcd,
 		instanceName: instanceName,
 		dirname:      dirname,
 		listenAddr:   listenAddr,
-		replStorage:  *replStorage,
-		storages:     make(map[string]Storage),
+		replClient:   replClient,
+		replStorage:  replStorage,
+		getOnDisk:    getOnDisk,
 	}
 }
 
@@ -87,26 +93,7 @@ func (s *Server) getStorageForCategory(category string) (Storage, error) {
 		return nil, errors.New("invalid category name")
 	}
 
-	s.m.Lock()
-	defer s.m.Unlock()
-
-	storage, ok := s.storages[category]
-	if ok {
-		return storage, nil
-	}
-
-	dir := filepath.Join(s.dirname, category)
-	if err := os.MkdirAll(dir, 0777); err != nil {
-		return nil, fmt.Errorf("creating directory for the category: %v", err)
-	}
-
-	storage, err := server.NewOndisk(dir, category, s.instanceName, &s.replStorage)
-	if err != nil {
-		return nil, err
-	}
-
-	s.storages[category] = storage
-	return storage, nil
+	return s.getOnDisk(category)
 }
 
 func (s *Server) writeHandler(ctx *fasthttp.RequestCtx) {

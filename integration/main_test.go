@@ -62,7 +62,13 @@ func simpleClientAndServerTest(t *testing.T, concurrent bool) {
 	log.Printf("Running chukcha on port %d", port)
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- InitAndServe(fmt.Sprintf("http://localhost:%d/", 2379), "hc", dbPath, fmt.Sprintf("localhost:%d", port))
+		errCh <- InitAndServe(InitArgs{
+			EtcdAddr:     []string{fmt.Sprintf("http://localhost:%d/", 2379)},
+			InstanceName: "hc",
+			ClusterName:  "test",
+			DirName:      dbPath,
+			ListenAddr:   fmt.Sprintf("localhost:%d", port),
+		})
 	}()
 	log.Printf("Waiting for the Chukcha port localhost:%d to open", port)
 	waitForPort(t, port, errCh)
