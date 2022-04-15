@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"chukcha/protocol"
 	"context"
 	"os"
 	"path/filepath"
@@ -137,7 +138,7 @@ func TestAckOfTheLastChunk(t *testing.T) {
 		t.Fatalf("len(ListChunks()) = %d, want %d", got, want)
 	}
 
-	if err := srv.Ack(chunks[0].Name, chunks[0].Size); err == nil {
+	if err := srv.Ack(context.Background(), chunks[0].Name, chunks[0].Size); err == nil {
 		t.Errorf("Ack(last chunk): got no errors, expected an error")
 	}
 }
@@ -147,7 +148,7 @@ func TestAckOfTheCompleteChunk(t *testing.T) {
 	srv := testNewOndisk(t, dir)
 	testCreateFile(t, filepath.Join(dir, "hc-chunk1"))
 
-	if err := srv.Ack("hc-chunk1", 0); err != nil {
+	if err := srv.Ack(context.Background(), "hc-chunk1", 0); err != nil {
 		t.Errorf("Ack(hc-chunk1) = %v, expected no errors", err)
 	}
 }
@@ -173,6 +174,10 @@ func (n *nilHooks) BeforeCreatingChunk(ctx context.Context, category string, fil
 	return nil
 }
 
+func (n *nilHooks) BeforeAcknowledgeChunk(ctx context.Context, category string, fileName string) error {
+	return nil
+}
+
 func testNewOndisk(t *testing.T, dir string) *OnDisk {
 	t.Helper()
 
@@ -189,5 +194,34 @@ func testCreateFile(t *testing.T, filename string) {
 
 	if _, err := os.Create(filename); err != nil {
 		t.Fatalf("could not create file %q: %v", filename, err)
+	}
+}
+
+func TestParseChunkFileName(t *testing.T) {
+	testCases := []struct {
+		filename     string
+		instanceName string
+		chunkIdx     int
+	}{
+		{
+			filename:     "hc1-chunk0000000",
+			instanceName: "hc1",
+			chunkIdx:     0,
+		},
+		{
+			filename:     "hc2-70-chunk00000123",
+			instanceName: "hc2-70",
+			chunkIdx:     123,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.filename, func(t *testing.T) {
+			instance, chunkIdx := protocol.ParseChunkFileName(tc.filename)
+
+			if instance != tc.instanceName || chunkIdx != tc.chunkIdx {
+				t.Errorf("parseChunkFileName(%q) = %q, %v; want %q %v", tc.filename, instance, chunkIdx, tc.instanceName, tc.chunkIdx)
+			}
+		})
 	}
 }

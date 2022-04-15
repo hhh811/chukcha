@@ -30,11 +30,23 @@ type Client struct {
 	instanceName string
 	httpCl       *http.Client
 	s            *client.Simple
+	perCategory  map[string]*CategoryDownloader
+}
+
+type CategoryDownloader struct {
+	eventsCh chan Chunk
+
+	state        *State
+	wr           DirectWriter
+	instanceName string
+	httpCl       *http.Client
+	s            *client.Simple
 }
 
 type DirectWriter interface {
 	Stat(category string, fileName string) (size int64, exists bool, err error)
 	WriteDirect(category string, fileName string, contents []byte) error
+	AckDirect(ctx context.Context, category string, chunk string) error
 }
 
 func NewClient(st *State, wr DirectWriter, instanceName string) *Client {
@@ -45,21 +57,67 @@ func NewClient(st *State, wr DirectWriter, instanceName string) *Client {
 		httpCl: &http.Client{
 			Timeout: defaultClientTimeout,
 		},
-		s: client.NewSimple(nil),
+		s:           client.NewSimple(nil),
+		perCategory: make(map[string]*CategoryDownloader),
 	}
 }
 
 func (c *Client) Loop(ctx context.Context) {
-	for ch := range c.state.WatchReplicationQueue(ctx, c.instanceName) {
-		c.downloadChunk(ch)
+	go c.acknowledgeLoop(ctx)
+	c.replicationLoop(ctx)
+}
 
-		if err := c.state.DeleteChunkFromReplicationQueue(ctx, c.instanceName, ch); err != nil {
-			log.Printf("could not delete chunk %+v from the replication queue: %v", ch, err)
+func (c *Client) acknowledgeLoop(ctx context.Context) {
+	for ch := range c.state.WatchAcknowledgeQueue(ctx, c.instanceName) {
+		log.Printf("acknowledge chunk %+v", ch)
+
+		if err := c.wr.AckDirect(ctx, ch.Category, ch.FileName); err != nil {
+			log.Printf("Could not ack chunk %+v from the acknowledge queue: %v", ch, err)
+		}
+
+		if err := c.state.DeleteChunkFromAcknowledgeQueue(ctx, c.instanceName, ch); err != nil {
+			log.Printf("Could not delete chunk %+v from the acknowledge queue: %v", ch, err)
 		}
 	}
 }
 
-func (c *Client) downloadChunk(ch Chunk) {
+func (c *Client) replicationLoop(ctx context.Context) {
+	for ch := range c.state.WatchReplicationQueue(ctx, c.instanceName) {
+		downloader, ok := c.perCategory[ch.Category]
+		if !ok {
+			downloader = &CategoryDownloader{
+				eventsCh:     make(chan Chunk, 3),
+				state:        c.state,
+				wr:           c.wr,
+				instanceName: c.instanceName,
+				httpCl:       c.httpCl,
+				s:            c.s,
+			}
+			go downloader.Loop(ctx)
+		}
+
+		c.perCategory[ch.Category] = downloader
+
+		downloader.eventsCh <- ch
+	}
+}
+
+func (c *CategoryDownloader) Loop(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case ch := <-c.eventsCh:
+			c.downloadChunk(ch)
+
+			if err := c.state.DeleteChunkFromReplicationQueue(ctx, c.instanceName, ch); err != nil {
+				log.Printf("could not delete chunk %+v from the replication queue: %v", ch, err)
+			}
+		}
+	}
+}
+
+func (c *CategoryDownloader) downloadChunk(ch Chunk) {
 	log.Printf("downloading chunk %+v", ch)
 	defer log.Printf("finished downloading chunk %+v", ch)
 
@@ -79,7 +137,7 @@ func (c *Client) downloadChunk(ch Chunk) {
 
 }
 
-func (c *Client) downloadChunkIteration(ch Chunk) error {
+func (c *CategoryDownloader) downloadChunkIteration(ch Chunk) error {
 	size, _, err := c.wr.Stat(ch.Category, ch.FileName)
 	if err != nil {
 		return fmt.Errorf("getting file stat: %v", err)
@@ -121,7 +179,7 @@ func (c *Client) downloadChunkIteration(ch Chunk) error {
 	return nil
 }
 
-func (c *Client) listenAddrForChunk(ch Chunk) (string, error) {
+func (c *CategoryDownloader) listenAddrForChunk(ch Chunk) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), defaultClientTimeout)
 	defer cancel()
 
@@ -145,7 +203,7 @@ func (c *Client) listenAddrForChunk(ch Chunk) (string, error) {
 	return "http://" + addr, nil
 }
 
-func (c *Client) getChunkInfo(addr string, curCh Chunk) (protocol.Chunk, error) {
+func (c *CategoryDownloader) getChunkInfo(addr string, curCh Chunk) (protocol.Chunk, error) {
 	chunks, err := c.s.ListChunks(curCh.Category, addr)
 	if err != nil {
 		return protocol.Chunk{}, err
@@ -160,7 +218,7 @@ func (c *Client) getChunkInfo(addr string, curCh Chunk) (protocol.Chunk, error) 
 	return protocol.Chunk{}, errNotFound
 }
 
-func (c *Client) downloadPart(addr string, ch Chunk, off int64) ([]byte, error) {
+func (c *CategoryDownloader) downloadPart(addr string, ch Chunk, off int64) ([]byte, error) {
 	u := url.Values{}
 	u.Add("off", strconv.Itoa(int(off)))
 	u.Add("maxSize", strconv.Itoa(batchSize))

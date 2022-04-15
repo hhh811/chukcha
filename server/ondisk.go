@@ -7,21 +7,19 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
-	"regexp"
-	"strconv"
-	"strings"
 	"sync"
 )
 
 const maxFileChunkSize = 20 * 1024 * 1024
 
 var errBufTooSmall = errors.New("the buffer is too small to contain a single message")
-var filenameRegexp = regexp.MustCompile("^chunk([0-9]+)$")
 
 type StorageHooks interface {
 	BeforeCreatingChunk(ctx context.Context, category string, fileName string) error
+	BeforeAcknowledgeChunk(ctx context.Context, category string, fileName string) error
 }
 
 type OnDisk struct {
@@ -62,21 +60,10 @@ func (s *OnDisk) initLastChunkIndex(dirname string) error {
 		return fmt.Errorf("readdir(%q): %v", dirname, err)
 	}
 
-	prefix := s.instanceName + "-"
-
 	for _, fi := range files {
-		if !strings.HasPrefix(fi.Name(), prefix) {
+		instance, chunkIdx := protocol.ParseChunkFileName(fi.Name())
+		if chunkIdx < 0 || instance != s.instanceName {
 			continue
-		}
-
-		res := filenameRegexp.FindStringSubmatch(strings.TrimPrefix(fi.Name(), prefix))
-		if res == nil {
-			continue
-		}
-
-		chunkIdx, err := strconv.Atoi(res[1])
-		if err != nil {
-			return fmt.Errorf("unexpected err parsing filename %q: %v", fi.Name(), err)
 		}
 
 		if uint64(chunkIdx)+1 >= s.lastChunkIdx {
@@ -212,7 +199,7 @@ func (s *OnDisk) isLastChunk(chunk string) bool {
 }
 
 // Ack marks the current chunk as done and delete its content
-func (s *OnDisk) Ack(chunk string, size uint64) error {
+func (s *OnDisk) Ack(ctx context.Context, chunk string, size uint64) error {
 	if s.isLastChunk(chunk) {
 		return fmt.Errorf("could not delete incomplete chunk %q", chunk)
 	}
@@ -228,8 +215,23 @@ func (s *OnDisk) Ack(chunk string, size uint64) error {
 		return fmt.Errorf("file was not fully processed: the supplied size %d is smaller than the chunk file size %d", size, fi.Size())
 	}
 
+	if err := s.repl.BeforeAcknowledgeChunk(ctx, s.category, chunk); err != nil {
+		log.Printf("Failed to replicate ack request: %v", err)
+	}
+
 	if err := os.Remove(chunkFilename); err != nil {
 		return fmt.Errorf("removint %q: %v", chunk, err)
+	}
+
+	s.forgetFileDescriptor(chunk)
+	return nil
+}
+
+func (s *OnDisk) AckDirect(chunk string) error {
+	chunkFilename := filepath.Join(s.dirname, chunk)
+
+	if err := os.Remove(chunkFilename); err != nil {
+		return fmt.Errorf("removing %q: %v", chunk, err)
 	}
 
 	s.forgetFileDescriptor(chunk)
@@ -245,17 +247,28 @@ func (s *OnDisk) ListChunks() ([]protocol.Chunk, error) {
 		return nil, err
 	}
 
-	for _, di := range dis {
+	for idx, di := range dis {
 		fi, err := di.Info()
 		if errors.Is(err, os.ErrNotExist) {
 			continue
 		} else if err != nil {
 			return nil, fmt.Errorf("readint directory: %v", err)
 		}
+
+		instanceName, _ := protocol.ParseChunkFileName(di.Name())
+
 		c := protocol.Chunk{
 			Name:     di.Name(),
-			Complete: (di.Name() != s.lastChunk),
+			Complete: true,
 			Size:     uint64(fi.Size()),
+		}
+
+		// dis is sorted by filename, we can get whether a file is complete by
+		// its name. But when a category is during replication, this method may be wrong
+		if idx == len(dis)-1 {
+			c.Complete = false
+		} else if nextInstance, _ := protocol.ParseChunkFileName(dis[idx+1].Name()); nextInstance != instanceName {
+			c.Complete = false
 		}
 		res = append(res, c)
 	}

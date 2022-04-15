@@ -115,8 +115,19 @@ func (c *State) AddChunkToReplicationQueue(ctx context.Context, targetInstance s
 	return c.put(ctx, key, ch.Owner)
 }
 
+func (c *State) AddChunkToAcknowledgeQueue(ctx context.Context, targetInstance string, ch Chunk) error {
+	key := "acknowledge/" + targetInstance + "/" + ch.Category + "/" + ch.FileName
+	return c.put(ctx, key, ch.Owner)
+}
+
 func (c *State) DeleteChunkFromReplicationQueue(ctx context.Context, targetInstance string, ch Chunk) error {
 	key := "replication/" + targetInstance + "/" + ch.Category + "/" + ch.FileName
+	_, err := c.cl.Delete(ctx, c.prefix+key)
+	return err
+}
+
+func (c *State) DeleteChunkFromAcknowledgeQueue(ctx context.Context, targetInstance string, ch Chunk) error {
+	key := "acknowledge/" + targetInstance + "/" + ch.Category + "/" + ch.FileName
 	_, err := c.cl.Delete(ctx, c.prefix+key)
 	return err
 }
@@ -135,7 +146,15 @@ func (c *State) parseReplicationKey(prefix string, kv *mvccpb.KeyValue) (Chunk, 
 }
 
 func (c *State) WatchReplicationQueue(ctx context.Context, instanceName string) chan Chunk {
-	prefix := c.prefix + "replication/" + instanceName + "/"
+	return c.watchQueue(ctx, "replication", instanceName)
+}
+
+func (c *State) WatchAcknowledgeQueue(ctx context.Context, instanceName string) chan Chunk {
+	return c.watchQueue(ctx, "acknowledge", instanceName)
+}
+
+func (c *State) watchQueue(ctx context.Context, queueName string, instanceName string) chan Chunk {
+	prefix := c.prefix + queueName + "/" + instanceName + "/"
 	resCh := make(chan Chunk)
 
 	go func() {

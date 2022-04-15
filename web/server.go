@@ -88,7 +88,7 @@ func isValidCatetory(category string) bool {
 }
 
 // get storage(ondisk) instance for category, if not found, create one
-func (s *Server) getStorageForCategory(category string) (Storage, error) {
+func (s *Server) getStorageForCategory(category string) (*server.OnDisk, error) {
 	if !isValidCatetory(category) {
 		return nil, errors.New("invalid category name")
 	}
@@ -130,7 +130,7 @@ func (s *Server) ackHandler(ctx *fasthttp.RequestCtx) {
 		ctx.WriteString(fmt.Sprintf("bad `size` GET param: %v", err))
 	}
 
-	if err := storage.Ack(string(chunk), uint64(size)); err != nil {
+	if err := storage.Ack(ctx, string(chunk), uint64(size)); err != nil {
 		ctx.SetStatusCode(fasthttp.StatusInternalServerError)
 		ctx.WriteString(err.Error())
 	}
