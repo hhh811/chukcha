@@ -2,6 +2,7 @@ package integration
 
 import (
 	"chukcha/client"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -28,78 +29,148 @@ const (
 
 func TestSimpleClientAndServeConcurrently(t *testing.T) {
 	t.Parallel()
-	simpleClientAndServerTest(t, true)
+	simpleClientAndServerTest(t, true, false)
 }
 
 func TestSimpleClientAndServeSequantially(t *testing.T) {
 	t.Parallel()
-	simpleClientAndServerTest(t, false)
+	simpleClientAndServerTest(t, false, false)
 }
 
-func simpleClientAndServerTest(t *testing.T, concurrent bool) {
+func TestSimpleClientWithReplicationSequentially(t *testing.T) {
+	t.Parallel()
+	simpleClientAndServerTest(t, false, true)
+}
+
+func TestSimpleClientWithReplicaitonConcurrently(t *testing.T) {
+	t.Parallel()
+	simpleClientAndServerTest(t, true, true)
+}
+
+type tweaks struct {
+	dbInitFn       func(t *testing.T, dbPath string)
+	modifyInitArgs func(t *testing.T, a *InitArgs)
+}
+
+func runChukcha(t *testing.T, withReplica bool, w tweaks) (addrs []string) {
 	t.Helper()
 
 	log.SetFlags(log.Flags() | log.Lmicroseconds)
 
-	port, err := freeport.GetFreePort()
+	port1, err := freeport.GetFreePort()
 	if err != nil {
 		t.Fatalf("Failed to get free port: %v", err)
 	}
 
-	dbPath, err := os.MkdirTemp(os.TempDir(), "chukcha")
+	port2, err := freeport.GetFreePort()
+	if err != nil {
+		t.Fatalf("Failed to get free port: %v", err)
+	}
+
+	dbPath, err := os.MkdirTemp(os.TempDir(), "chukcha-hc1")
 	if err != nil {
 		t.Fatalf("Failed to create temp dir: %v", err)
 	}
 
-	t.Cleanup(func() { os.RemoveAll(dbPath) })
+	if w.dbInitFn != nil {
+		w.dbInitFn(t, dbPath)
+	}
 
-	categoryPath := filepath.Join(dbPath, "numbers")
-	os.MkdirAll(categoryPath, 0777)
-
-	ioutil.WriteFile(filepath.Join(categoryPath, fmt.Sprintf("hc-chunk%09d", 1)), []byte("12345\n"), 0666)
+	ports := []int{port1}
+	if withReplica {
+		ports = append(ports, port2)
+	}
 
 	// start chukcha
-	log.Printf("Running chukcha on port %d", port)
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- InitAndServe(InitArgs{
-			EtcdAddr:     []string{fmt.Sprintf("http://localhost:%d/", 2379)},
-			InstanceName: "hc",
-			ClusterName:  "test",
-			DirName:      dbPath,
-			ListenAddr:   fmt.Sprintf("localhost:%d", port),
-		})
-	}()
-	log.Printf("Waiting for the Chukcha port localhost:%d to open", port)
-	waitForPort(t, port, errCh)
+	for _, port := range ports {
+		log.Printf("Running chukcha on port %d", port)
+
+		dirname := dbPath
+		instanceName := "hc1"
+
+		if port != port1 {
+			instanceName = "hc2"
+
+			dirname, err = os.MkdirTemp(t.TempDir(), "chukcha-"+instanceName)
+			if err != nil {
+				t.Fatalf("Failed to create temp dir: %v", err)
+			}
+		}
+
+		errCh := make(chan error, 1)
+		go func(port int) {
+			a := InitArgs{
+				LogWriter:    log.Default().Writer(),
+				EtcdAddr:     []string{fmt.Sprintf("http://localhost:%d/", 2379)},
+				InstanceName: instanceName,
+				ClusterName:  "test",
+				DirName:      dirname,
+				ListenAddr:   fmt.Sprintf("localhost:%d", port),
+				MaxChunkSize: 20 * 1024 * 1024,
+			}
+
+			if w.modifyInitArgs != nil {
+				w.modifyInitArgs(t, &a)
+			}
+
+			errCh <- InitAndServe(a)
+		}(port)
+
+		log.Printf("Waiting for the Chukcha port localhost:%d to open", port)
+		waitForPort(t, port, make(chan error, 1))
+
+		addrs = append(addrs, fmt.Sprintf("http://localhost:%d", port))
+	}
+
+	return addrs
+}
+
+func simpleClientAndServerTest(t *testing.T, concurrent, withReplica bool) {
+	t.Helper()
+
+	ctx := context.Background()
+
+	addrs := runChukcha(t, withReplica, tweaks{
+		dbInitFn: func(t *testing.T, dbPath string) {
+			categoryPath := filepath.Join(dbPath, "numbers")
+			os.MkdirAll(categoryPath, 0777)
+
+			ioutil.WriteFile(filepath.Join(categoryPath, fmt.Sprintf("hc1-chunk%09d", 1)), []byte("12345\n"), 0666)
+		},
+	})
 
 	log.Printf("Starting the test")
 
-	s := client.NewSimple([]string{fmt.Sprintf("http://localhost:%d", port)})
+	s := client.NewSimple(addrs)
 
 	var want, got int64
+	var err error
+
+	// contents of chunk already exist
+	alreadyWant := int64(12345)
 
 	if concurrent {
-		want, got, err = sendAndReceiveConcurrently(s)
+		want, got, err = sendAndReceiveConcurrently(ctx, s, withReplica)
+		if err != nil {
+			t.Fatalf("sendAndReceiveConcurrently: %v", err)
+		}
+
+		want += alreadyWant
 	} else {
-		want, err = send(s)
+		want, err = send(ctx, s)
 		if err != nil {
 			t.Fatalf("send error: %v", err)
 		}
 
-		sendFinishedCh := make(chan bool, 1)
-		sendFinishedCh <- true
-		got, err = receive(s, sendFinishedCh)
+		want += alreadyWant
+
+		sendFinishedCh := make(chan time.Time, 1)
+		sendFinishedCh <- time.Now()
+		got, err = receive(ctx, s, sendFinishedCh, withReplica, want)
 		if err != nil {
 			t.Fatalf("receive error: %v", err)
 		}
 	}
-
-	if err != nil {
-		t.Errorf("sendAndReceiveConcurrently failed: %v", err)
-	}
-
-	want += 12345
 
 	if want != got {
 		t.Errorf("the expected sum %d is not equal to the actual sum %d", want, got)
@@ -134,22 +205,26 @@ type sumAndErr struct {
 	err error
 }
 
-func sendAndReceiveConcurrently(s *client.Simple) (want, got int64, err error) {
+const expectedSumCalculatedManully = 50000005012345
+
+func sendAndReceiveConcurrently(ctx context.Context, s *client.Simple, withReplica bool) (want, got int64, err error) {
 	wantCh := make(chan sumAndErr, 1)
 	gotCh := make(chan sumAndErr, 1)
-	sendFinishedCh := make(chan bool, 1)
+	sendFinishedCh := make(chan time.Time, 1)
 
 	go func() {
-		want, err := send(s)
+		want, err := send(ctx, s)
+		log.Printf("Send finished")
+
 		wantCh <- sumAndErr{
 			sum: want,
 			err: err,
 		}
-		sendFinishedCh <- true
+		sendFinishedCh <- time.Now()
 	}()
 
 	go func() {
-		got, err := receive(s, sendFinishedCh)
+		got, err := receive(ctx, s, sendFinishedCh, withReplica, expectedSumCalculatedManully)
 		gotCh <- sumAndErr{
 			sum: got,
 			err: err,
@@ -169,7 +244,7 @@ func sendAndReceiveConcurrently(s *client.Simple) (want, got int64, err error) {
 	return wantRes.sum, gotRes.sum, err
 }
 
-func send(s *client.Simple) (sum int64, err error) {
+func send(ctx context.Context, s *client.Simple) (sum int64, err error) {
 	sendStart := time.Now()
 	var networkTime time.Duration
 	var sendBytes int
@@ -188,7 +263,7 @@ func send(s *client.Simple) (sum int64, err error) {
 
 		if len(buf) >= maxBufferSize {
 			start := time.Now()
-			if err := s.Send("numbers", buf); err != nil {
+			if err := s.Send(ctx, "numbers", buf); err != nil {
 				return 0, err
 			}
 			networkTime += time.Since(start)
@@ -200,7 +275,7 @@ func send(s *client.Simple) (sum int64, err error) {
 
 	if len(buf) != 0 {
 		start := time.Now()
-		if err := s.Send("numbers", buf); err != nil {
+		if err := s.Send(ctx, "numbers", buf); err != nil {
 			return 0, err
 		}
 		networkTime += time.Since(start)
@@ -212,7 +287,7 @@ func send(s *client.Simple) (sum int64, err error) {
 
 var randomTempErr = errors.New("a random temporary error occurred")
 
-func receive(s *client.Simple, sendFinishedCh chan bool) (sum int64, err error) {
+func receive(ctx context.Context, s *client.Simple, sendFinishedCh chan time.Time, withReplica bool, maxExpectedSum int64) (sum int64, err error) {
 	buf := make([]byte, maxBufferSize)
 
 	var parseTime time.Duration
@@ -226,6 +301,7 @@ func receive(s *client.Simple, sendFinishedCh chan bool) (sum int64, err error) 
 	}
 
 	sendFinished := false
+	var sendFinishedTs time.Time
 
 	loopCnt := 0
 
@@ -233,13 +309,14 @@ func receive(s *client.Simple, sendFinishedCh chan bool) (sum int64, err error) 
 		loopCnt++
 
 		select {
-		case <-sendFinishedCh:
+		case ts := <-sendFinishedCh:
 			log.Printf("Receive: got information that send finished")
 			sendFinished = true
+			sendFinishedTs = ts
 		default:
 		}
 
-		err := s.Process("numbers", buf, func(res []byte) error {
+		err := s.Process(ctx, "numbers", buf, func(res []byte) error {
 			if loopCnt%10 == 0 {
 				return randomTempErr
 			}
@@ -259,11 +336,20 @@ func receive(s *client.Simple, sendFinishedCh chan bool) (sum int64, err error) 
 			return nil
 		})
 
+		log.Printf("Got sum %d, want sum %d", sum, maxExpectedSum)
+
 		if errors.Is(err, randomTempErr) {
 			continue
 		} else if errors.Is(err, io.EOF) {
 			if sendFinished {
-				return sum, nil
+				if !withReplica {
+					return sum, nil
+				}
+
+				if sum >= maxExpectedSum || time.Since(sendFinishedTs) >= 10*time.Second {
+					log.Printf("sum (%d) >= maxExpected (%d) || time.Since(sendFinishedTs) (%s) >= 10*time.Second", sum, maxExpectedSum, time.Since(sendFinishedTs))
+					return sum, nil
+				}
 			}
 			time.Sleep(time.Millisecond * 10)
 			continue

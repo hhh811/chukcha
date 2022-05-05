@@ -4,6 +4,7 @@ import (
 	"chukcha/integration"
 	"flag"
 	"log"
+	"os"
 	"strings"
 )
 
@@ -35,11 +36,13 @@ func main() {
 	}
 
 	a := integration.InitArgs{
+		LogWriter:    os.Stderr,
 		EtcdAddr:     strings.Split(*etcdAddr, ","),
 		ClusterName:  *clusterName,
 		InstanceName: *instanceName,
 		DirName:      *dirname,
 		ListenAddr:   *listenAddr,
+		MaxChunkSize: 20 * 1024 * 1024,
 	}
 
 	if err := integration.InitAndServe(a); err != nil {

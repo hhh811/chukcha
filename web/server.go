@@ -9,6 +9,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -25,6 +27,7 @@ type Storage interface {
 
 // Server implements a web server
 type Server struct {
+	logger       *log.Logger
 	instanceName string
 	dirname      string
 	listenAddr   string
@@ -38,6 +41,7 @@ type Server struct {
 type GetOnDiskFn func(category string) (*server.OnDisk, error)
 
 func NewServer(
+	logger *log.Logger,
 	replClient *replication.State,
 	instanceName string,
 	dirname string,
@@ -46,6 +50,7 @@ func NewServer(
 	getOnDisk GetOnDiskFn,
 ) *Server {
 	return &Server{
+		logger:       logger,
 		instanceName: instanceName,
 		dirname:      dirname,
 		listenAddr:   listenAddr,
@@ -137,6 +142,18 @@ func (s *Server) ackHandler(ctx *fasthttp.RequestCtx) {
 }
 
 func (s *Server) readHandler(ctx *fasthttp.RequestCtx) {
+	chunk := ctx.QueryArgs().Peek("chunk")
+	if len(chunk) == 0 {
+		ctx.SetStatusCode(fasthttp.StatusBadRequest)
+		ctx.WriteString("bad `chunk` GET param: chunk name must be provided")
+		return
+	}
+
+	fromReplication, _ := ctx.QueryArgs().GetUint("from_replication")
+	if fromReplication == 1 {
+
+	}
+
 	storage, err := s.getStorageForCategory(string(ctx.QueryArgs().Peek("category")))
 	if err != nil {
 		ctx.SetStatusCode(fasthttp.StatusBadRequest)
@@ -156,15 +173,13 @@ func (s *Server) readHandler(ctx *fasthttp.RequestCtx) {
 		ctx.WriteString(fmt.Sprintf("bad `maxSize` GET param: %v", err))
 	}
 
-	chunk := ctx.QueryArgs().Peek("chunk")
-	if len(chunk) == 0 {
-		ctx.SetStatusCode(fasthttp.StatusBadRequest)
-		ctx.WriteString(fmt.Sprintf("bad `chunk` GET param: chunk name must be provided"))
-	}
-
 	err = storage.Read(string(chunk), uint64(off), uint64(maxSize), ctx)
 	if err != nil && err != io.EOF {
-		ctx.SetStatusCode(fasthttp.StatusInternalServerError)
+		if os.IsNotExist(err) {
+			ctx.SetStatusCode(fasthttp.StatusNotFound)
+		} else {
+			ctx.SetStatusCode(fasthttp.StatusInternalServerError)
+		}
 		ctx.WriteString(err.Error())
 		return
 	}
@@ -176,6 +191,11 @@ func (s *Server) listChunksHandler(ctx *fasthttp.RequestCtx) {
 		ctx.SetStatusCode(fasthttp.StatusBadRequest)
 		ctx.WriteString(err.Error())
 		return
+	}
+
+	fromReplication, _ := ctx.QueryArgs().GetUint("from_replication")
+	if fromReplication == 1 {
+
 	}
 
 	chunks, err := storage.ListChunks()

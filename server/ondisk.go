@@ -10,40 +10,46 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 )
 
-const maxFileChunkSize = 20 * 1024 * 1024
-
 var errBufTooSmall = errors.New("the buffer is too small to contain a single message")
 
+const DeletedSuffix = ".deleted"
+
 type StorageHooks interface {
-	BeforeCreatingChunk(ctx context.Context, category string, fileName string) error
-	BeforeAcknowledgeChunk(ctx context.Context, category string, fileName string) error
+	AfterCreatingChunk(ctx context.Context, category string, fileName string) error
+	AfterAcknowledgeChunk(ctx context.Context, category string, fileName string) error
 }
 
 type OnDisk struct {
+	logger       *log.Logger
 	dirname      string
 	category     string
 	instanceName string
+	maxChunkSize uint64
 
 	repl StorageHooks
 
-	writeMu       sync.RWMutex
-	lastChunk     string
-	lastChunkSize uint64
-	lastChunkIdx  uint64
+	writeMu                     sync.RWMutex
+	lastChunk                   string
+	lastChunkSize               uint64
+	lastChunkIdx                uint64
+	lastChunkAddedToReplication bool
 
 	fpsMu sync.Mutex
 	fps   map[string]*os.File
 }
 
-func NewOndisk(dirname, category, instanceName string, repl StorageHooks) (*OnDisk, error) {
+func NewOndisk(logger *log.Logger, dirname, category, instanceName string, maxChunkSize uint64, repl StorageHooks) (*OnDisk, error) {
 	s := &OnDisk{
+		logger:       logger,
 		dirname:      dirname,
 		category:     category,
 		instanceName: instanceName,
 		repl:         repl,
+		maxChunkSize: maxChunkSize,
 		fps:          make(map[string]*os.File),
 	}
 
@@ -92,19 +98,24 @@ func (s *OnDisk) Write(ctx context.Context, msgs []byte) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
-	if s.lastChunk == "" || s.lastChunkSize+uint64(len(msgs)) > maxFileChunkSize {
+	if s.lastChunk == "" || s.lastChunkSize+uint64(len(msgs)) > s.maxChunkSize {
 		s.lastChunk = fmt.Sprintf("%s-chunk%09d", s.instanceName, s.lastChunkIdx)
 		s.lastChunkSize = 0
 		s.lastChunkIdx++
-
-		if err := s.repl.BeforeCreatingChunk(ctx, s.category, s.lastChunk); err != nil {
-			return fmt.Errorf("before creating new chunk: %w", err)
-		}
+		s.lastChunkAddedToReplication = false
 	}
 
 	fp, err := s.getFileDescriptor(s.lastChunk, true)
 	if err != nil {
 		return err
+	}
+
+	if !s.lastChunkAddedToReplication {
+		if err := s.repl.AfterCreatingChunk(ctx, s.category, s.lastChunk); err != nil {
+			return fmt.Errorf("after creating new chunk: %w", err)
+		}
+
+		s.lastChunkAddedToReplication = true
 	}
 
 	_, err = fp.Write(msgs)
@@ -215,23 +226,41 @@ func (s *OnDisk) Ack(ctx context.Context, chunk string, size uint64) error {
 		return fmt.Errorf("file was not fully processed: the supplied size %d is smaller than the chunk file size %d", size, fi.Size())
 	}
 
-	if err := s.repl.BeforeAcknowledgeChunk(ctx, s.category, chunk); err != nil {
-		log.Printf("Failed to replicate ack request: %v", err)
+	if err := s.doAckChunk(chunk); err != nil {
+		return fmt.Errorf("ack %q: %v", chunk, err)
 	}
 
-	if err := os.Remove(chunkFilename); err != nil {
-		return fmt.Errorf("removint %q: %v", chunk, err)
+	if err := s.repl.AfterAcknowledgeChunk(ctx, s.category, chunk); err != nil {
+		s.logger.Printf("Failed to replicate ack request: %v", err)
 	}
 
 	s.forgetFileDescriptor(chunk)
 	return nil
 }
 
-func (s *OnDisk) AckDirect(chunk string) error {
+func (s *OnDisk) doAckChunk(chunk string) error {
 	chunkFilename := filepath.Join(s.dirname, chunk)
 
-	if err := os.Remove(chunkFilename); err != nil {
-		return fmt.Errorf("removing %q: %v", chunk, err)
+	fp, err := os.OpenFile(chunkFilename, os.O_WRONLY, 0666)
+	if err != nil {
+		return fmt.Errorf("failed to get file descriptor for ack operation for chunk %q: %v", chunk, err)
+	}
+	defer fp.Close()
+
+	if err := fp.Truncate(0); err != nil {
+		return fmt.Errorf("failed to truncate file %q: %v", chunk, err)
+	}
+
+	if err := os.Rename(chunkFilename, chunkFilename+DeletedSuffix); err != nil {
+		return fmt.Errorf("failed to rename file %q to the deleted form: %v", chunk, err)
+	}
+
+	return nil
+}
+
+func (s *OnDisk) AckDirect(chunk string) error {
+	if err := s.doAckChunk(chunk); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("adk %q: %v", chunk, err)
 	}
 
 	s.forgetFileDescriptor(chunk)
@@ -253,6 +282,9 @@ func (s *OnDisk) ListChunks() ([]protocol.Chunk, error) {
 			continue
 		} else if err != nil {
 			return nil, fmt.Errorf("readint directory: %v", err)
+		}
+		if strings.HasSuffix(di.Name(), DeletedSuffix) {
+			continue
 		}
 
 		instanceName, _ := protocol.ParseChunkFileName(di.Name())

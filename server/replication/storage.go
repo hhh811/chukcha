@@ -3,22 +3,25 @@ package replication
 import (
 	"context"
 	"fmt"
+	"log"
 )
 
 type Storage struct {
+	logger          *log.Logger
 	client          *State
 	currentInstance string
 }
 
-func NewStorage(client *State, currentInstance string) *Storage {
+func NewStorage(logger *log.Logger, client *State, currentInstance string) *Storage {
 	return &Storage{
+		logger:          logger,
 		client:          client,
 		currentInstance: currentInstance,
 	}
 }
 
 // when a peer create a new file, writing its name to etcd to tell other peers about its creation
-func (s *Storage) BeforeCreatingChunk(ctx context.Context, category string, fileName string) error {
+func (s *Storage) AfterCreatingChunk(ctx context.Context, category string, fileName string) error {
 	peers, err := s.client.ListPeers(ctx)
 	if err != nil {
 		return fmt.Errorf("getting peers from etcd: %v", err)
@@ -41,7 +44,7 @@ func (s *Storage) BeforeCreatingChunk(ctx context.Context, category string, file
 	return nil
 }
 
-func (s *Storage) BeforeAcknowledgeChunk(ctx context.Context, category string, fileName string) error {
+func (s *Storage) AfterAcknowledgeChunk(ctx context.Context, category string, fileName string) error {
 	peers, err := s.client.ListPeers(ctx)
 	if err != nil {
 		return fmt.Errorf("getting peers from etcd: %v", err)
